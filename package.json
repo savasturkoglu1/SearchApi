@@ -1,0 +1,30 @@
+{
+  "name": "browser-capture-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manual browser server for capturing XHR and fetch traffic",
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env --import tsx --watch src/server.ts",
+    "start": "node --env-file-if-exists=.env --import tsx src/server.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start:prod": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/**/*.test.ts",
+    "smoke:browser": "node --env-file-if-exists=.env --import tsx scripts/browser-smoke.ts",
+    "smoke:search": "node --env-file-if-exists=.env --import tsx scripts/search-smoke.ts",
+    "browser:install": "patchright install chromium && playwright install chromium"
+  },
+  "dependencies": {
+    "@crawlee/browser-pool": "^3.16.0",
+    "fastify": "^5.6.0",
+    "patchright": "^1.59.1",
+    "playwright": "^1.59.1",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "tsx": "^4.23.0",
+    "typescript": "^7.0.0"
+  }
+}
