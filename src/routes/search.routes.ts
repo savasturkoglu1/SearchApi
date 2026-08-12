@@ -1,18 +1,33 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
-import type { TravelSearch } from "../travel/travel-search.js";
+import { MARKET_PROFILE_IDS } from "../markets/market-profile.js";
+import type { MarketTravelSearch } from "../travel/market-travel.search.js";
+import type { StaySearchResult } from "../travel/travel-search.js";
 
 const dateSchema = z.iso.date();
-const currencySchema = z.string().trim().length(3).transform((value) => value.toUpperCase());
-const languageSchema = z.string().trim().regex(/^[a-z]{2}(?:-[A-Z]{2})?$/).default("tr");
+const marketProfileSchema = z.enum(MARKET_PROFILE_IDS);
 const locationSuggestionSchema = z.object({
   q: z.string().trim().min(1).max(120),
-  currency: currencySchema.default("TRY"),
-  language: languageSchema,
+  marketProfile: marketProfileSchema,
 });
 const flightOfferSelectionSchema = z.object({
   offerId: z.string().trim().min(1).max(16_384),
+  marketProfile: marketProfileSchema,
+});
+const webSearchSchema = z.object({
+  query: z.string().trim().min(1).max(500),
+  limit: z.number().int().min(1).max(20).default(10),
+  safeSearch: z.boolean().default(true),
+  marketProfile: marketProfileSchema,
+});
+const destinationResearchSchema = z.object({
+  destination: z.string().trim().min(2).max(160),
+  interests: z.array(z.string().trim().min(1).max(80)).max(12).default([]),
+  maxPlaces: z.number().int().min(1).max(20).default(10),
+  maxArticles: z.number().int().min(1).max(20).default(10),
+  safeSearch: z.boolean().default(true),
+  marketProfile: marketProfileSchema,
 });
 
 const flightSearchSchema = z
@@ -24,8 +39,7 @@ const flightSearchSchema = z
     adults: z.number().int().min(1).max(9).default(1),
     children: z.number().int().min(0).max(9).default(0),
     cabin: z.enum(["economy", "premium_economy", "business", "first"]).default("economy"),
-    currency: currencySchema.default("TRY"),
-    language: languageSchema,
+    marketProfile: marketProfileSchema,
   })
   .refine((value) => !value.returnDate || value.returnDate >= value.departureDate, {
     message: "returnDate departureDate'ten önce olamaz",
@@ -48,8 +62,8 @@ const accommodationSearchSchema = z
     adults: z.number().int().min(1).max(30).default(2),
     rooms: z.number().int().min(1).max(10).default(1),
     children: z.number().int().min(0).max(20).default(0),
-    currency: currencySchema.default("TRY"),
-    language: languageSchema,
+    includeImages: z.boolean().default(false),
+    marketProfile: marketProfileSchema,
   })
   .refine((value) => value.checkOut > value.checkIn, {
     message: "checkOut checkIn'den sonra olmalı",
@@ -66,13 +80,27 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   return result.data;
 }
 
-export async function searchRoutes(app: FastifyInstance, travelSearch: TravelSearch): Promise<void> {
+export async function searchRoutes(
+  app: FastifyInstance,
+  travelSearch: MarketTravelSearch,
+): Promise<void> {
+  app.get("/market-profiles", async () => ({ profiles: travelSearch.status() }));
+
+  app.post("/search/web", async (request) => {
+    const input = parse(webSearchSchema, request.body);
+    return travelSearch.searchWeb(input);
+  });
+
+  app.post("/research/destinations", async (request) => {
+    const input = parse(destinationResearchSchema, request.body);
+    return travelSearch.researchDestination(input);
+  });
+
   app.get("/locations/flights", async (request) => {
     const query = parse(locationSuggestionSchema, request.query);
     return {
       suggestions: await travelSearch.suggestFlightLocations(query.q, {
-        currency: query.currency,
-        language: query.language,
+        marketProfile: query.marketProfile,
       }),
     };
   });
@@ -86,8 +114,7 @@ export async function searchRoutes(app: FastifyInstance, travelSearch: TravelSea
       adults: input.adults,
       children: input.children,
       cabin: input.cabin,
-      currency: input.currency,
-      language: input.language,
+      marketProfile: input.marketProfile,
       ...(input.returnDate ? { returnDate: input.returnDate } : {}),
     });
   });
@@ -104,11 +131,32 @@ export async function searchRoutes(app: FastifyInstance, travelSearch: TravelSea
 
   app.post("/search/hotels", async (request) => {
     const input = parse(accommodationSearchSchema, request.body);
-    return travelSearch.searchHotels(input);
+    return projectAccommodationImages(
+      await travelSearch.searchHotels(input),
+      input.includeImages,
+    );
   });
 
   app.post("/search/vacation-rentals", async (request) => {
     const input = parse(accommodationSearchSchema, request.body);
-    return travelSearch.searchVacationRentals(input);
+    return projectAccommodationImages(
+      await travelSearch.searchVacationRentals(input),
+      input.includeImages,
+    );
   });
+}
+
+function projectAccommodationImages(
+  result: StaySearchResult,
+  includeImages: boolean,
+): StaySearchResult {
+  if (includeImages) return result;
+  return {
+    ...result,
+    stays: result.stays.map((stay) => {
+      const projected = { ...stay };
+      delete projected.images;
+      return projected;
+    }),
+  };
 }

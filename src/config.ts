@@ -18,6 +18,7 @@ const envSchema = z.object({
   BROWSER_ENGINE: z.enum(["patchright", "playwright"]).default("patchright"),
   BROWSER_HEADLESS: booleanFromString,
   BROWSER_CHANNEL: optionalString.default("chrome"),
+  BROWSER_PROFILE_DIR: z.string().min(1).default(".browser-profiles"),
   MAX_CONTEXTS: z.coerce.number().int().min(1).max(50).default(5),
   CAPTURE_DIR: z.string().min(1).default(".api-capiture"),
   CAPTURE_MAX_BODY_BYTES: z.coerce
@@ -39,6 +40,7 @@ export interface AppConfig {
     headless: boolean;
     channel?: string;
     maxContexts: number;
+    profileDirectory: string;
   };
   capture: {
     directory: string;
@@ -56,6 +58,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     engine: parsed.BROWSER_ENGINE,
     headless: parsed.BROWSER_HEADLESS,
     maxContexts: parsed.MAX_CONTEXTS,
+    profileDirectory: path.resolve(parsed.BROWSER_PROFILE_DIR),
     ...(parsed.BROWSER_CHANNEL ? { channel: parsed.BROWSER_CHANNEL } : {}),
   };
 

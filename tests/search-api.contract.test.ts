@@ -1,22 +1,123 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { Page } from "playwright";
 
 import Fastify from "fastify";
 
+import type {
+  DestinationResearch,
+  DestinationResearchInput,
+  DestinationResearchResult,
+} from "../src/destination/destination-research.js";
+import { MARKET_PROFILES } from "../src/markets/market-profile.js";
+import type { BrowserPageProvider, BrowserStatus } from "../src/managers/browser.manager.js";
 import { searchRoutes } from "../src/routes/search.routes.js";
 import { GoogleTravelSearch } from "../src/travel/google-travel.search.js";
+import {
+  ProfiledTravelSearch,
+  type MarketTravelSearch,
+} from "../src/travel/market-travel.search.js";
 import type {
   FlightLocationLookupRequest,
   FlightLocationLookupResult,
   TravelRpcRequest,
   TravelRpcResponse,
   TravelRpcTransport,
+  TravelSearch,
+  WebPageSearchRequest,
+  WebPageSearchResponse,
 } from "../src/travel/travel-search.js";
+
+class FakeMarketBrowser implements BrowserPageProvider {
+  private running = false;
+
+  async start(): Promise<void> {
+    this.running = true;
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+  }
+
+  async newPage(): Promise<Page> {
+    let closed = false;
+    return {
+      evaluate: async () => ({ locale: "tr-TR", timezoneId: "Europe/Istanbul" }),
+      isClosed: () => closed,
+      close: async () => {
+        closed = true;
+      },
+    } as unknown as Page;
+  }
+
+  async closePage(page: Page): Promise<void> {
+    await page.close();
+  }
+
+  status(): BrowserStatus {
+    return {
+      running: this.running,
+      engine: "patchright",
+      headless: true,
+      channel: null,
+      openPages: this.running ? 1 : 0,
+      sessionMode: "isolated",
+    };
+  }
+}
+
+function marketSearchWith(travelSearch: TravelSearch): MarketTravelSearch {
+  return new ProfiledTravelSearch(
+    [MARKET_PROFILES["TR-IST"]],
+    () => ({
+      browserManager: new FakeMarketBrowser(),
+      travelSearch,
+      destinationResearch: new EmptyDestinationResearch(),
+    }),
+  );
+}
+
+class EmptyDestinationResearch implements DestinationResearch {
+  async research(input: DestinationResearchInput): Promise<DestinationResearchResult> {
+    return {
+      destination: input.destination,
+      query: {
+        interests: input.interests,
+        language: input.language,
+        country: input.country,
+      },
+      places: [],
+      articles: [],
+      searchUrls: { articles: [] },
+      retrievedAt: "2026-08-06T00:00:00.000Z",
+      errors: [],
+    };
+  }
+}
 
 class FixtureTransport implements TravelRpcTransport {
   readonly requests: TravelRpcRequest[] = [];
+  readonly webRequests: WebPageSearchRequest[] = [];
 
   constructor(private readonly bodies: string[]) {}
+
+  async searchWeb(request: WebPageSearchRequest): Promise<WebPageSearchResponse> {
+    this.webRequests.push(request);
+    return {
+      results: [
+        {
+          rank: 1,
+          title: "Varşova Gezi Rehberi",
+          url: "https://example.com/varsova-gezi-plani",
+          displayUrl: "example.com",
+          description: "Varşova için üç günlük gezi planı.",
+        },
+      ],
+      sourceUrl: request.sourceUrl,
+      captureContextId: "11111111-1111-4111-8111-111111111111",
+      elapsedMs: 25,
+    };
+  }
 
   async execute(request: TravelRpcRequest): Promise<TravelRpcResponse> {
     this.requests.push(request);
@@ -40,13 +141,52 @@ class FixtureTransport implements TravelRpcTransport {
   async closeAll(): Promise<void> {}
 }
 
+test("genel Google aramasını normalize edilmiş organik sonuçlarla döndürür", async () => {
+  const app = Fastify();
+  const transport = new FixtureTransport([]);
+  const travelSearch = new GoogleTravelSearch(transport, 90_000);
+  await app.register(async (v1) => searchRoutes(v1, marketSearchWith(travelSearch)), { prefix: "/v1" });
+
+  const response = await app.inject({
+    method: "POST",
+    url: "/v1/search/web",
+    payload: {
+      query: "varşova gezi planı",
+      limit: 5,
+      marketProfile: "TR-IST",
+      safeSearch: true,
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  const body = response.json<{
+    query: { text: string; country: string };
+    results: Array<{ rank: number; title: string; url: string; description?: string }>;
+    searchUrl: string;
+  }>();
+  assert.equal(body.query.text, "varşova gezi planı");
+  assert.equal(body.query.country, "TR");
+  assert.deepEqual(body.results[0], {
+    rank: 1,
+    title: "Varşova Gezi Rehberi",
+    url: "https://example.com/varsova-gezi-plani",
+    displayUrl: "example.com",
+    description: "Varşova için üç günlük gezi planı.",
+  });
+  assert.match(body.searchUrl, /google\.com\/search/);
+  assert.match(body.searchUrl, /q=var%C5%9Fova\+gezi\+plan%C4%B1/);
+  assert.equal(transport.webRequests[0]?.limit, 5);
+
+  await app.close();
+});
+
 test("uçuş araması canlı fiyat durumunu ve en düşük fiyat içgörüsünü döndürür", async () => {
   const app = Fastify();
   const travelSearch = new GoogleTravelSearch(
     new FixtureTransport([googleBody(null, [flightOffer()])]),
     90_000,
   );
-  await app.register(async (v1) => searchRoutes(v1, travelSearch), { prefix: "/v1" });
+  await app.register(async (v1) => searchRoutes(v1, marketSearchWith(travelSearch)), { prefix: "/v1" });
 
   const response = await app.inject({
     method: "POST",
@@ -54,13 +194,12 @@ test("uçuş araması canlı fiyat durumunu ve en düşük fiyat içgörüsünü
     payload: {
       origin: "IST",
       destination: "AMS",
+      marketProfile: "TR-IST",
       departureDate: "2026-09-15",
       returnDate: "2026-09-19",
       adults: 1,
       children: 0,
       cabin: "economy",
-      currency: "TRY",
-      language: "tr",
     },
   });
 
@@ -75,32 +214,34 @@ test("uçuş araması canlı fiyat durumunu ve en düşük fiyat içgörüsünü
   await app.close();
 });
 
-test("otel araması satın alma linkini ve canlı fiyat bilgisini döndürür", async () => {
+test("otel araması resimleri varsayılan olarak gizler ve istenince döndürür", async () => {
   const app = Fastify();
   const travelSearch = new GoogleTravelSearch(
-    new FixtureTransport([googleBody("AtySUc", [{ cards: [hotelOffer()] }])]),
+    new FixtureTransport([
+      googleBody("AtySUc", [{ cards: [hotelOffer()] }]),
+      googleBody("AtySUc", [{ cards: [hotelOffer()] }]),
+    ]),
     90_000,
   );
-  await app.register(async (v1) => searchRoutes(v1, travelSearch), { prefix: "/v1" });
+  await app.register(async (v1) => searchRoutes(v1, marketSearchWith(travelSearch)), { prefix: "/v1" });
 
   const response = await app.inject({
     method: "POST",
     url: "/v1/search/hotels",
     payload: {
       destination: "Amsterdam",
+      marketProfile: "TR-IST",
       checkIn: "2026-09-17",
       checkOut: "2026-09-20",
       adults: 2,
       rooms: 1,
       children: 0,
-      currency: "TRY",
-      language: "tr",
     },
   });
 
   assert.equal(response.statusCode, 200);
   const body = response.json<{
-    stays: Array<{ bookingUrl?: string; priceIsEstimated?: boolean }>;
+    stays: Array<{ bookingUrl?: string; priceIsEstimated?: boolean; images?: string[] }>;
     priceInsights?: { lowestPrice?: number };
   }>();
   assert.equal(
@@ -109,36 +250,59 @@ test("otel araması satın alma linkini ve canlı fiyat bilgisini döndürür", 
   );
   assert.equal(body.stays[0]?.priceIsEstimated, false);
   assert.equal(body.priceInsights?.lowestPrice, 4070.25);
+  assert.equal("images" in (body.stays[0] ?? {}), false);
+
+  const withImagesResponse = await app.inject({
+    method: "POST",
+    url: "/v1/search/hotels",
+    payload: {
+      destination: "Amsterdam",
+      marketProfile: "TR-IST",
+      checkIn: "2026-09-17",
+      checkOut: "2026-09-20",
+      adults: 2,
+      rooms: 1,
+      children: 0,
+      includeImages: true,
+    },
+  });
+  assert.equal(withImagesResponse.statusCode, 200);
+  assert.deepEqual(
+    withImagesResponse.json<{ stays: Array<{ images?: string[] }> }>().stays[0]?.images,
+    ["https://images.example/hotel.jpg"],
+  );
 
   await app.close();
 });
 
-test("kiralık yer araması satın alma linkini ve canlı fiyat bilgisini döndürür", async () => {
+test("kiralık yer araması resimleri varsayılan olarak gizler ve istenince döndürür", async () => {
   const app = Fastify();
   const travelSearch = new GoogleTravelSearch(
-    new FixtureTransport([googleBody("AtySUc", [{ cards: [vacationRentalOffer()] }])]),
+    new FixtureTransport([
+      googleBody("AtySUc", [{ cards: [vacationRentalOffer()] }]),
+      googleBody("AtySUc", [{ cards: [vacationRentalOffer()] }]),
+    ]),
     90_000,
   );
-  await app.register(async (v1) => searchRoutes(v1, travelSearch), { prefix: "/v1" });
+  await app.register(async (v1) => searchRoutes(v1, marketSearchWith(travelSearch)), { prefix: "/v1" });
 
   const response = await app.inject({
     method: "POST",
     url: "/v1/search/vacation-rentals",
     payload: {
       destination: "Kalkan",
+      marketProfile: "TR-IST",
       checkIn: "2026-08-13",
       checkOut: "2026-08-20",
       adults: 2,
       rooms: 1,
       children: 0,
-      currency: "TRY",
-      language: "tr",
     },
   });
 
   assert.equal(response.statusCode, 200);
   const body = response.json<{
-    stays: Array<{ bookingUrl?: string; priceIsEstimated?: boolean }>;
+    stays: Array<{ bookingUrl?: string; priceIsEstimated?: boolean; images?: string[] }>;
     priceInsights?: { lowestPrice?: number };
   }>();
   assert.equal(
@@ -147,6 +311,27 @@ test("kiralık yer araması satın alma linkini ve canlı fiyat bilgisini dönd�
   );
   assert.equal(body.stays[0]?.priceIsEstimated, false);
   assert.equal(body.priceInsights?.lowestPrice, 22_676.771);
+  assert.equal("images" in (body.stays[0] ?? {}), false);
+
+  const withImagesResponse = await app.inject({
+    method: "POST",
+    url: "/v1/search/vacation-rentals",
+    payload: {
+      destination: "Kalkan",
+      marketProfile: "TR-IST",
+      checkIn: "2026-08-13",
+      checkOut: "2026-08-20",
+      adults: 2,
+      rooms: 1,
+      children: 0,
+      includeImages: true,
+    },
+  });
+  assert.equal(withImagesResponse.statusCode, 200);
+  assert.deepEqual(
+    withImagesResponse.json<{ stays: Array<{ images?: string[] }> }>().stays[0]?.images,
+    ["https://images.example/villa.jpg"],
+  );
 
   await app.close();
 });
@@ -158,7 +343,7 @@ test("seçilen gidiş için dönüş seçeneklerini birleşik uçuşlar olarak d
     googleBody(null, [returnFlightOffer()]),
   ]);
   const travelSearch = new GoogleTravelSearch(transport, 90_000);
-  await app.register(async (v1) => searchRoutes(v1, travelSearch), { prefix: "/v1" });
+  await app.register(async (v1) => searchRoutes(v1, marketSearchWith(travelSearch)), { prefix: "/v1" });
 
   const initialResponse = await app.inject({
     method: "POST",
@@ -166,13 +351,12 @@ test("seçilen gidiş için dönüş seçeneklerini birleşik uçuşlar olarak d
     payload: {
       origin: "IST",
       destination: "AMS",
+      marketProfile: "TR-IST",
       departureDate: "2026-09-15",
       returnDate: "2026-09-19",
       adults: 1,
       children: 0,
       cabin: "economy",
-      currency: "TRY",
-      language: "tr",
     },
   });
   const initial = initialResponse.json<{ offers: Array<{ sourceOfferId: string }> }>();
@@ -180,7 +364,7 @@ test("seçilen gidiş için dönüş seçeneklerini birleşik uçuşlar olarak d
   const response = await app.inject({
     method: "POST",
     url: "/v1/search/flights/returns",
-    payload: { offerId: initial.offers[0]?.sourceOfferId },
+    payload: { offerId: initial.offers[0]?.sourceOfferId, marketProfile: "TR-IST" },
   });
 
   assert.equal(response.statusCode, 200);
@@ -199,6 +383,13 @@ test("seçilen gidiş için dönüş seçeneklerini birleşik uçuşlar olarak d
   assert.equal(body.offers[0]?.totalPrice, 13_250);
   assert.equal(body.offers[0]?.priceIsEstimated, false);
   assert.match(transport.requests[1]?.sourceUrl ?? "", /tfu=/);
+  const returnRpc = decodeFlightRpc(transport.requests[1]);
+  assert.equal(transport.requests[1]?.inPage?.sessionKey, "flights");
+  assert.equal(
+    ((returnRpc[1] as unknown[])[13] as unknown[][])[0]?.[8] instanceof Array,
+    true,
+    "dönüş RPC'si seçilen gidiş segmentlerini taşımalı",
+  );
 
   await app.close();
 });
@@ -228,7 +419,7 @@ test("tam uçuş seçimi için satıcı linkini ve bagaj koşullarını döndür
     ]),
   ]);
   const travelSearch = new GoogleTravelSearch(transport, 90_000);
-  await app.register(async (v1) => searchRoutes(v1, travelSearch), { prefix: "/v1" });
+  await app.register(async (v1) => searchRoutes(v1, marketSearchWith(travelSearch)), { prefix: "/v1" });
 
   const initial = await app.inject({
     method: "POST",
@@ -236,13 +427,12 @@ test("tam uçuş seçimi için satıcı linkini ve bagaj koşullarını döndür
     payload: {
       origin: "IST",
       destination: "AMS",
+      marketProfile: "TR-IST",
       departureDate: "2026-09-15",
       returnDate: "2026-09-19",
       adults: 1,
       children: 0,
       cabin: "economy",
-      currency: "TRY",
-      language: "tr",
     },
   });
   const outboundId = initial.json<{ offers: Array<{ sourceOfferId: string }> }>()
@@ -250,7 +440,7 @@ test("tam uçuş seçimi için satıcı linkini ve bagaj koşullarını döndür
   const returns = await app.inject({
     method: "POST",
     url: "/v1/search/flights/returns",
-    payload: { offerId: outboundId },
+    payload: { offerId: outboundId, marketProfile: "TR-IST" },
   });
   const returnId = returns.json<{ offers: Array<{ sourceOfferId: string }> }>()
     .offers[0]?.sourceOfferId;
@@ -258,7 +448,7 @@ test("tam uçuş seçimi için satıcı linkini ve bagaj koşullarını döndür
   const response = await app.inject({
     method: "POST",
     url: "/v1/search/flights/bookings",
-    payload: { offerId: returnId },
+    payload: { offerId: returnId, marketProfile: "TR-IST" },
   });
 
   assert.equal(response.statusCode, 200);
@@ -309,9 +499,25 @@ test("tam uçuş seçimi için satıcı linkini ve bagaj koşullarını döndür
     typicalPriceRange: [14_000, 20_000],
   });
   assert.match(transport.requests[2]?.sourceUrl ?? "", /\/travel\/flights\/booking/);
+  assert.match(
+    transport.requests[2]?.inPage?.endpointPath ?? "",
+    /GetBookingResults$/,
+  );
+  const bookingRpc = decodeFlightRpc(transport.requests[2]);
+  assert.equal((bookingRpc[0] as [null, string])[1], "return-token");
 
   await app.close();
 });
+
+function decodeFlightRpc(request: TravelRpcRequest | undefined): unknown[] {
+  const body = request?.inPage?.body;
+  assert.ok(body, "in-page flight recipe üretilmeli");
+  const outer = JSON.parse(new URLSearchParams(body).get("f.req") ?? "null") as [
+    null,
+    string,
+  ];
+  return JSON.parse(outer[1]) as unknown[];
+}
 
 function googleBody(rpcId: string | null, payload: unknown): string {
   const frame = JSON.stringify([["wrb.fr", rpcId, JSON.stringify(payload)]]);

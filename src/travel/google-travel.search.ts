@@ -18,6 +18,7 @@ import type {
   GoogleFlightOffer,
   GoogleHotelOffer,
   HotelSearchInput,
+  InPageRpcRecipe,
   Layover,
   NormalizedOffer,
   NormalizedStay,
@@ -26,6 +27,8 @@ import type {
   TravelRpcTransport,
   TravelSearch,
   VacationRentalSearchInput,
+  WebSearchInput,
+  WebSearchResult,
 } from "./travel-search.js";
 
 type AccommodationMode = "hotels" | "vacation_rentals";
@@ -42,6 +45,11 @@ interface FlightSelectionContext {
 const FLIGHT_SOURCE = "google_flights_browser";
 const HOTEL_SOURCE = "google_hotels_browser";
 const VACATION_RENTAL_SOURCE = "google_vacation_rentals_browser";
+const FLIGHT_SHOPPING_PATH =
+  "/_/FlightsFrontendUi/data/travel.frontend.flights.FlightsFrontendService/GetShoppingResults";
+const FLIGHT_BOOKING_PATH =
+  "/_/FlightsFrontendUi/data/travel.frontend.flights.FlightsFrontendService/GetBookingResults";
+const STAY_SEARCH_PATH = "/_/TravelFrontendUi/data/batchexecute";
 
 export class GoogleTravelSearch implements TravelSearch {
   private readonly flightSelections = new Map<string, FlightSelectionContext>();
@@ -51,11 +59,32 @@ export class GoogleTravelSearch implements TravelSearch {
     private readonly timeoutMs: number,
   ) {}
 
+  async searchWeb(input: WebSearchInput): Promise<WebSearchResult> {
+    const response = await this.transport.searchWeb({
+      sourceUrl: buildWebSearchUrl(input),
+      limit: input.limit,
+      timeoutMs: this.timeoutMs,
+    });
+    return {
+      query: {
+        text: input.query,
+        language: input.language,
+        country: input.country,
+        safeSearch: input.safeSearch,
+      },
+      results: response.results,
+      searchUrl: response.sourceUrl,
+      retrievedAt: new Date().toISOString(),
+      errors: [],
+    };
+  }
+
   async searchFlights(input: FlightSearchInput): Promise<FlightSearchResult> {
     const [origin, destination] = await this.resolveLocations(
       [input.origin, input.destination],
       input.currency,
       input.language,
+      input.country,
     );
     if (!origin || !destination) {
       throw new ExternalSearchError("Kalkış veya varış lokasyonu çözülemedi");
@@ -64,6 +93,7 @@ export class GoogleTravelSearch implements TravelSearch {
       sourceUrl: buildFlightSearchUrl(input, origin, destination),
       responseUrlIncludes: "FlightsFrontendService/GetShoppingResults",
       timeoutMs: this.timeoutMs,
+      inPage: buildFlightShoppingRecipe(input, origin, destination),
     });
     const googleOffers = parseFlightOffers(response.body, input.currency);
     if (googleOffers.length === 0) {
@@ -98,6 +128,12 @@ export class GoogleTravelSearch implements TravelSearch {
       sourceUrl: buildFlightReturnSearchUrl(selected),
       responseUrlIncludes: "FlightsFrontendService/GetShoppingResults",
       timeoutMs: this.timeoutMs,
+      inPage: buildFlightShoppingRecipe(
+        selected.input,
+        selected.origin,
+        selected.destination,
+        selected.outbound,
+      ),
     });
     const returnOffers = parseFlightOffers(response.body, selected.input.currency);
     if (returnOffers.length === 0) {
@@ -135,6 +171,7 @@ export class GoogleTravelSearch implements TravelSearch {
       sourceUrl: buildFlightBookingUrl(selected),
       responseUrlIncludes: "FlightsFrontendService/GetBookingResults",
       timeoutMs: this.timeoutMs,
+      inPage: buildFlightBookingRecipe(selected),
     });
     const googleOptions = parseFlightBookingOptions(response.body, selected.input.currency);
     const priceInsights = parseFlightPriceInsights(response.body);
@@ -182,6 +219,7 @@ export class GoogleTravelSearch implements TravelSearch {
       sourceUrl: buildAccommodationSearchUrl(input, destination, mode),
       responseUrlIncludes: "rpcids=AtySUc",
       timeoutMs: this.timeoutMs,
+      inPage: buildAccommodationRecipe(input, destination, mode),
     });
     const offers = mode === "hotels"
       ? parseHotelOffers(response.body, input.currency)
@@ -208,12 +246,13 @@ export class GoogleTravelSearch implements TravelSearch {
 
   async suggestFlightLocations(
     query: string,
-    options: { currency: string; language: string },
+    options: { currency: string; language: string; country: string },
   ): Promise<FlightLocationSuggestion[]> {
     const [lookup] = await this.transport.lookupFlightLocations({
       queries: [query],
       currency: options.currency,
       language: options.language,
+      country: options.country,
       timeoutMs: this.timeoutMs,
     });
     return lookup ? parseFlightLocationSuggestions(lookup.body) : [];
@@ -249,6 +288,7 @@ export class GoogleTravelSearch implements TravelSearch {
     queries: string[],
     currency: string,
     language: string,
+    country: string,
   ): Promise<FlightLocationSuggestion[]> {
     const resolved = new Map<string, FlightLocationSuggestion>();
     const unresolved = queries.filter((query) => {
@@ -269,6 +309,7 @@ export class GoogleTravelSearch implements TravelSearch {
         queries: [...new Set(unresolved)],
         currency,
         language,
+        country,
         timeoutMs: this.timeoutMs,
       });
       for (const lookup of lookups) {
@@ -299,11 +340,12 @@ export class GoogleTravelSearch implements TravelSearch {
         queries: [input.destination],
         currency: input.currency,
         language: input.language,
+        country: input.country,
         timeoutMs: this.timeoutMs,
       });
       if (lookup) {
-        const exact = selectExactLocation(input.destination, parseFlightLocationSuggestions(lookup.body));
-        if (exact) return exact;
+        const selected = selectLocation(input.destination, parseFlightLocationSuggestions(lookup.body));
+        if (selected) return selected;
       }
     } catch {
       // Stay araması `q` parametresiyle ham lokasyon adını da çözebilir.
@@ -315,6 +357,18 @@ export class GoogleTravelSearch implements TravelSearch {
       type: "city",
     };
   }
+}
+
+function buildWebSearchUrl(input: WebSearchInput): string {
+  const url = new URL("https://www.google.com/search");
+  url.searchParams.set("q", input.query);
+  url.searchParams.set("hl", input.language);
+  url.searchParams.set("gl", input.country);
+  url.searchParams.set("num", String(input.limit));
+  url.searchParams.set("safe", input.safeSearch ? "active" : "off");
+  url.searchParams.set("filter", "1");
+  url.searchParams.set("pws", "0");
+  return url.toString();
 }
 
 function toFlightSearchQuery(input: FlightSearchInput): FlightSearchQuery {
@@ -498,6 +552,255 @@ function formatFlightNumber(carrierCode: string, value: string): string {
   return `${carrierCode} ${number}`.trim();
 }
 
+function buildFlightShoppingRecipe(
+  input: FlightSearchInput,
+  origin: FlightLocationSuggestion,
+  destination: FlightLocationSuggestion,
+  outbound?: GoogleFlightOffer,
+): InPageRpcRecipe {
+  const query = buildFlightRpcQuery(input, origin, destination, outbound);
+  return buildFlightRpcRecipe(
+    input,
+    FLIGHT_SHOPPING_PATH,
+    JSON.stringify([null, JSON.stringify([[], query, 0, 0, 0, 1])]),
+  );
+}
+
+function buildFlightBookingRecipe(selection: FlightSelectionContext): InPageRpcRecipe {
+  const { input, origin, destination, outbound, inbound } = selection;
+  const finalSelection = inbound ?? outbound;
+  const query = buildFlightRpcQuery(input, origin, destination, outbound, inbound);
+  return buildFlightRpcRecipe(
+    input,
+    FLIGHT_BOOKING_PATH,
+    JSON.stringify([
+      null,
+      JSON.stringify([[null, finalSelection.selectionToken], query, null, 0]),
+    ]),
+  );
+}
+
+function buildFlightRpcRecipe(
+  input: FlightSearchInput,
+  endpointPath: string,
+  requestValue: string,
+): InPageRpcRecipe {
+  return {
+    sessionKey: "flights",
+    bootstrapUrl: buildTravelBootstrapUrl("/travel/flights", input),
+    endpointPath,
+    query: commonRpcQuery(input.language),
+    headers: googleRpcHeaders(input.language, input.country, input.currency),
+    body: new URLSearchParams({ "f.req": requestValue }).toString(),
+    minimumResponseBytes: 512,
+  };
+}
+
+function buildFlightRpcQuery(
+  input: FlightSearchInput,
+  origin: FlightLocationSuggestion,
+  destination: FlightLocationSuggestion,
+  outbound?: GoogleFlightOffer,
+  inbound?: GoogleFlightOffer,
+): unknown[] {
+  const legs: unknown[] = [
+    buildFlightRpcLeg(
+      origin.entityId,
+      destination.entityId,
+      input.departureDate,
+      outbound,
+    ),
+  ];
+  if (input.returnDate) {
+    legs.push(
+      buildFlightRpcLeg(
+        destination.entityId,
+        origin.entityId,
+        input.returnDate,
+        inbound,
+      ),
+    );
+  }
+  return [
+    null,
+    null,
+    1,
+    null,
+    [],
+    1,
+    [input.adults, input.children, 0, 0],
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    legs,
+    null,
+    null,
+    null,
+    1,
+  ];
+}
+
+function buildFlightRpcLeg(
+  originId: string,
+  destinationId: string,
+  date: string,
+  selected?: GoogleFlightOffer,
+): unknown[] {
+  return [
+    [[[originId, 4]]],
+    [[[destinationId, 4]]],
+    null,
+    0,
+    null,
+    null,
+    date,
+    null,
+    selected ? selected.leg.segments.map(toFlightRpcSegment) : null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    3,
+  ];
+}
+
+function toFlightRpcSegment(segment: GoogleFlightOffer["leg"]["segments"][number]): unknown[] {
+  return [
+    segment.origin.code,
+    segment.departureLocal.slice(0, 10),
+    segment.destination.code,
+    null,
+    segment.carrierCode,
+    segment.flightNumber.startsWith(segment.carrierCode)
+      ? segment.flightNumber.slice(segment.carrierCode.length)
+      : segment.flightNumber,
+  ];
+}
+
+function buildAccommodationRecipe(
+  input: AccommodationSearchInput,
+  destination: FlightLocationSuggestion,
+  mode: AccommodationMode,
+): InPageRpcRecipe {
+  const modeCode = mode === "vacation_rentals" ? 2 : 1;
+  const occupancy = [
+    Array.from({ length: input.adults }, () => [3]),
+    input.children,
+  ];
+  const destinationValue = destination.entityId
+    ? [null, [[destination.entityId, null, null, null, null, null, destination.name]]]
+    : [null, [[null, null, null, null, null, null, destination.name]], []];
+  const datesValue = [
+    null,
+    [
+      dateTuple(input.checkIn),
+      dateTuple(input.checkOut),
+      daysBetween(input.checkIn, input.checkOut),
+    ],
+    null,
+    null,
+    null,
+    [input.rooms],
+  ];
+  const currencyValue = [[
+    null,
+    null,
+    null,
+    null,
+    null,
+    null,
+    input.currency,
+    null,
+    null,
+    null,
+    null,
+    [modeCode],
+  ]];
+  const inner = [
+    destination.name,
+    [
+      modeCode,
+      occupancy,
+      [destinationValue, datesValue, null, currencyValue],
+      [null, null, null, null, null, null, null, 13],
+      null,
+      1,
+    ],
+  ];
+  const batch = [[[
+    "AtySUc",
+    JSON.stringify(inner),
+    null,
+    "1",
+  ]]];
+  return {
+    sessionKey: "stays",
+    bootstrapUrl: buildTravelBootstrapUrl("/travel/search", input),
+    endpointPath: STAY_SEARCH_PATH,
+    query: {
+      rpcids: "AtySUc",
+      "source-path": "/travel/search",
+      ...commonRpcQuery(input.language),
+    },
+    headers: googleRpcHeaders(input.language, input.country, input.currency),
+    body: new URLSearchParams({ "f.req": JSON.stringify(batch) }).toString(),
+    minimumResponseBytes: 512,
+  };
+}
+
+function buildTravelBootstrapUrl(
+  pathname: "/travel/flights" | "/travel/search",
+  input: { language: string; country: string; currency: string },
+): string {
+  const url = new URL(pathname, "https://www.google.com");
+  url.searchParams.set("hl", input.language);
+  url.searchParams.set("gl", input.country);
+  url.searchParams.set("curr", input.currency);
+  return url.toString();
+}
+
+function commonRpcQuery(language: string): Record<string, string> {
+  return {
+    hl: language,
+    "soc-app": "162",
+    "soc-platform": "1",
+    "soc-device": "1",
+    rt: "c",
+  };
+}
+
+function googleRpcHeaders(
+  language: string,
+  country: string,
+  currency: string,
+): Record<string, string> {
+  return {
+    "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+    "x-same-domain": "1",
+    "x-goog-ext-259736195-jspb": JSON.stringify([
+      language,
+      country,
+      currency,
+      1,
+      null,
+      [-180],
+      null,
+      null,
+      1,
+      [],
+    ]),
+  };
+}
+
+function dateTuple(date: string): number[] {
+  const [year, month, day] = date.split("-").map(Number);
+  return [year ?? 0, month ?? 0, day ?? 0];
+}
+
 export function buildFlightSearchUrl(
   input: FlightSearchInput,
   origin: FlightLocationSuggestion,
@@ -505,9 +808,10 @@ export function buildFlightSearchUrl(
 ): string {
   const url = new URL("https://www.google.com/travel/flights/search");
   url.searchParams.set("tfs", encodeFlightState(input, origin, destination));
-  url.searchParams.set("tfu", "EgYIABAAGAA");
+  url.searchParams.set("tfu", "EgYIABABGAA");
   url.searchParams.set("curr", input.currency);
   url.searchParams.set("hl", input.language);
+  url.searchParams.set("gl", input.country);
   return url.toString();
 }
 
@@ -517,6 +821,7 @@ function buildFlightReturnSearchUrl(selection: FlightSelectionContext): string {
   url.searchParams.set("tfu", encodeFlightSelectionToken(selection.outbound.selectionToken));
   url.searchParams.set("curr", selection.input.currency);
   url.searchParams.set("hl", selection.input.language);
+  url.searchParams.set("gl", selection.input.country);
   return url.toString();
 }
 
@@ -527,6 +832,7 @@ function buildFlightBookingUrl(selection: FlightSelectionContext): string {
   url.searchParams.set("tfu", encodeFlightSelectionToken(finalSelection.selectionToken));
   url.searchParams.set("curr", selection.input.currency);
   url.searchParams.set("hl", selection.input.language);
+  url.searchParams.set("gl", selection.input.country);
   return url.toString();
 }
 
@@ -541,6 +847,7 @@ function buildAccommodationSearchUrl(
   url.searchParams.set("gsas", "1");
   url.searchParams.set("curr", input.currency);
   url.searchParams.set("hl", input.language);
+  url.searchParams.set("gl", input.country);
   return url.toString();
 }
 
@@ -587,18 +894,6 @@ function selectLocation(
   );
 }
 
-function selectExactLocation(
-  query: string,
-  suggestions: FlightLocationSuggestion[],
-): FlightLocationSuggestion | undefined {
-  const normalized = query.trim().toLocaleLowerCase("en-US");
-  return suggestions.find((item) =>
-    item.code?.toLocaleLowerCase("en-US") === normalized ||
-    item.name.toLocaleLowerCase("en-US") === normalized ||
-    item.label.toLocaleLowerCase("en-US") === normalized
-  );
-}
-
 function encodeFlightState(
   input: FlightSearchInput,
   origin: FlightLocationSuggestion,
@@ -606,10 +901,10 @@ function encodeFlightState(
 ): string {
   const output: number[] = [];
   writeVarintField(output, 1, 28n);
-  writeVarintField(output, 2, input.returnDate ? 2n : 1n);
-  writeMessageField(output, 3, flightSlice(input.departureDate, origin.entityId, destination.entityId));
+  writeVarintField(output, 2, 2n);
+  writeMessageField(output, 3, flightSlice(input.departureDate, origin, destination));
   if (input.returnDate) {
-    writeMessageField(output, 3, flightSlice(input.returnDate, destination.entityId, origin.entityId));
+    writeMessageField(output, 3, flightSlice(input.returnDate, destination, origin));
   }
   for (let index = 0; index < input.adults; index += 1) {
     writeVarintField(output, 8, 1n);
@@ -622,7 +917,7 @@ function encodeFlightState(
   const filter: number[] = [];
   writeVarintField(filter, 1, 0xffffffffffffffffn);
   writeMessageField(output, 16, filter);
-  writeVarintField(output, 19, 1n);
+  writeVarintField(output, 19, input.returnDate ? 1n : 2n);
   return Buffer.from(output).toString("base64url");
 }
 
@@ -633,19 +928,19 @@ function encodeSelectedFlightState(
   const { input, origin, destination, outbound, inbound } = selection;
   const output: number[] = [];
   writeVarintField(output, 1, 28n);
-  writeVarintField(output, 2, input.returnDate ? 2n : 1n);
+  writeVarintField(output, 2, 2n);
   writeMessageField(
     output,
     3,
-    selectedFlightSlice(input.departureDate, origin.entityId, destination.entityId, outbound),
+    selectedFlightSlice(input.departureDate, origin, destination, outbound),
   );
   if (input.returnDate) {
     writeMessageField(
       output,
       3,
       includeInbound && inbound
-        ? selectedFlightSlice(input.returnDate, destination.entityId, origin.entityId, inbound)
-        : flightSlice(input.returnDate, destination.entityId, origin.entityId),
+        ? selectedFlightSlice(input.returnDate, destination, origin, inbound)
+        : flightSlice(input.returnDate, destination, origin),
     );
   }
   for (let index = 0; index < input.adults; index += 1) writeVarintField(output, 8, 1n);
@@ -655,17 +950,17 @@ function encodeSelectedFlightState(
   const filter: number[] = [];
   writeVarintField(filter, 1, 0xffffffffffffffffn);
   writeMessageField(output, 16, filter);
-  writeVarintField(output, 19, 1n);
+  writeVarintField(output, 19, input.returnDate ? 1n : 2n);
   return Buffer.from(output).toString("base64url");
 }
 
 function selectedFlightSlice(
   date: string,
-  originId: string,
-  destinationId: string,
+  origin: FlightLocationSuggestion,
+  destination: FlightLocationSuggestion,
   offer: GoogleFlightOffer,
 ): number[] {
-  const slice = flightSlice(date, originId, destinationId);
+  const slice = flightSlice(date, origin, destination);
   for (const segment of offer.leg.segments) {
     const flight = [] as number[];
     writeStringField(flight, 1, segment.origin.code);
@@ -694,19 +989,23 @@ function encodeFlightSelectionToken(selectionToken: string): string {
   return Buffer.from(output).toString("base64url");
 }
 
-function flightSlice(date: string, originId: string, destinationId: string): number[] {
+function flightSlice(
+  date: string,
+  origin: FlightLocationSuggestion,
+  destination: FlightLocationSuggestion,
+): number[] {
   const slice: number[] = [];
   writeStringField(slice, 2, date);
-  writeMessageField(slice, 13, locationMessage(originId));
-  writeMessageField(slice, 14, locationMessage(destinationId));
+  writeMessageField(slice, 13, locationMessage(origin));
+  writeMessageField(slice, 14, locationMessage(destination));
   return slice;
 }
 
-function locationMessage(entityId: string): number[] {
-  const location: number[] = [];
-  writeVarintField(location, 1, 2n);
-  writeStringField(location, 2, entityId);
-  return location;
+function locationMessage(location: FlightLocationSuggestion): number[] {
+  const message: number[] = [];
+  writeVarintField(message, 1, location.type === "airport" ? 2n : 3n);
+  writeStringField(message, 2, location.entityId);
+  return message;
 }
 
 function encodeAccommodationState(
