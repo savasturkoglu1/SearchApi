@@ -5,3 +5,7 @@ dist/
 
 .api-capiture/*
 !.api-capiture/.gitkeep
+.browser-profiles/
+
+# Yerel API tokenı içerir; Postman'a doğrudan import edilir, repoya alınmaz.
+postman/*.local.postman_collection.json

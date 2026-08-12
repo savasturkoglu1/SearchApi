@@ -1,7 +1,7 @@
 import { BrowserPool, PlaywrightPlugin } from "@crawlee/browser-pool";
 import { chromium as patchrightChromium } from "patchright";
 import { chromium as playwrightChromium } from "playwright";
-import type { BrowserType, Page } from "playwright";
+import type { BrowserContextOptions, BrowserType, Page } from "playwright";
 
 import { BrowserStateError } from "../errors.js";
 
@@ -10,6 +10,12 @@ export interface BrowserManagerOptions {
   headless: boolean;
   channel?: string;
   maxContexts: number;
+  sessionMode?: "isolated" | "persistent";
+  userDataDir?: string;
+  contextOptions?: Pick<
+    BrowserContextOptions,
+    "geolocation" | "locale" | "permissions" | "timezoneId"
+  >;
 }
 
 export interface BrowserStatus {
@@ -18,6 +24,7 @@ export interface BrowserStatus {
   headless: boolean;
   channel: string | null;
   openPages: number;
+  sessionMode: "isolated" | "persistent";
 }
 
 export interface BrowserPageProvider {
@@ -26,6 +33,13 @@ export interface BrowserPageProvider {
   newPage(id: string): Promise<Page>;
   closePage(page: Page): Promise<void>;
   status(): BrowserStatus;
+}
+
+interface PlaywrightBrowserPool {
+  newPage(options: {
+    id: string;
+    pageOptions?: BrowserContextOptions;
+  }): Promise<Page>;
 }
 
 export class BrowserManager implements BrowserPageProvider {
@@ -40,14 +54,19 @@ export class BrowserManager implements BrowserPageProvider {
       ? patchrightChromium
       : playwrightChromium) as unknown as BrowserType;
 
+    const persistent = this.options.sessionMode === "persistent";
     const launchOptions = {
       headless: this.options.headless,
       ...(this.options.channel ? { channel: this.options.channel } : {}),
+      ...(persistent && this.options.contextOptions ? this.options.contextOptions : {}),
     };
 
     const plugin = new PlaywrightPlugin(browserType, {
       launchOptions,
-      useIncognitoPages: true,
+      useIncognitoPages: !persistent,
+      ...(persistent && this.options.userDataDir
+        ? { userDataDir: this.options.userDataDir }
+        : {}),
     });
 
     this.pool = new BrowserPool({
@@ -74,11 +93,26 @@ export class BrowserManager implements BrowserPageProvider {
       throw new BrowserStateError("BrowserManager çalışmıyor");
     }
 
-    return (await this.pool.newPage({ id })) as unknown as Page;
+    const pageOptions = this.options.sessionMode === "persistent"
+      ? undefined
+      : this.options.contextOptions
+        ? { ...this.options.contextOptions }
+        : undefined;
+    // BrowserPool'un varsayılan generic'i Playwright context seçeneklerini
+    // `never` olarak daraltıyor; çalışan Playwright adapter sözleşmesini burada
+    // açıkça tanımlıyoruz.
+    const pool = this.pool as unknown as PlaywrightBrowserPool;
+    return pool.newPage({
+      id,
+      ...(pageOptions ? { pageOptions } : {}),
+    });
   }
 
   async closePage(page: Page): Promise<void> {
-    if (!page.isClosed()) await page.close();
+    // Browser UI'ından veya browser crash'iyle kapanan bir Playwright page'i
+    // BrowserPool registry'sinde kalabilir. Crawlee page.close() metodunu override
+    // ederek bu kaydı temizlediği için isClosed() true olsa da çağrı yapılmalıdır.
+    await page.close();
   }
 
   status(): BrowserStatus {
@@ -88,6 +122,7 @@ export class BrowserManager implements BrowserPageProvider {
       headless: this.options.headless,
       channel: this.options.channel ?? null,
       openPages: this.pool?.pages.size ?? 0,
+      sessionMode: this.options.sessionMode ?? "isolated",
     };
   }
 }
