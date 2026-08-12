@@ -36,6 +36,7 @@ try {
     cabin: "economy",
     currency: "TRY",
     language: "tr",
+    country: "TR",
   });
   const outboundOfferId = flight.offers[0]?.sourceOfferId;
   if (!outboundOfferId) throw new Error("Smoke aramasında gidiş offerId dönmedi");
@@ -52,6 +53,7 @@ try {
     children: 0,
     currency: "TRY",
     language: "tr",
+    country: "TR",
   });
   console.log(JSON.stringify({
     flights: flight.offers.length,
