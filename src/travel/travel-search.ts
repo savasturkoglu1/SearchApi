@@ -11,10 +11,40 @@ export interface FlightSearchInput {
   cabin: "economy" | "premium_economy" | "business" | "first";
   currency: CurrencyCode;
   language: TravelLanguage;
+  country: string;
 }
 
 export interface FlightOfferSelectionInput {
   offerId: string;
+}
+
+export interface WebSearchInput {
+  query: string;
+  limit: number;
+  language: TravelLanguage;
+  country: string;
+  safeSearch: boolean;
+}
+
+export interface WebSearchItem {
+  rank: number;
+  title: string;
+  url: string;
+  displayUrl: string;
+  description?: string;
+}
+
+export interface WebSearchResult {
+  query: {
+    text: string;
+    language: TravelLanguage;
+    country: string;
+    safeSearch: boolean;
+  };
+  results: WebSearchItem[];
+  searchUrl: string;
+  retrievedAt: string;
+  errors: SourceError[];
 }
 
 // FlightScanner `src/adapters/types.ts` ile aynı public response sözleşmesi.
@@ -175,6 +205,7 @@ export interface AccommodationSearchInput {
   children: number;
   currency: CurrencyCode;
   language: TravelLanguage;
+  country: string;
 }
 
 export type HotelSearchInput = AccommodationSearchInput;
@@ -279,6 +310,7 @@ export interface StaySearchResult {
 export type HotelSearchResult = StaySearchResult;
 
 export interface TravelSearch {
+  searchWeb(input: WebSearchInput): Promise<WebSearchResult>;
   searchFlights(input: FlightSearchInput): Promise<FlightSearchResult>;
   searchFlightReturns(input: FlightOfferSelectionInput): Promise<FlightSearchResult>;
   searchFlightBookings(input: FlightOfferSelectionInput): Promise<FlightBookingResult>;
@@ -286,7 +318,7 @@ export interface TravelSearch {
   searchVacationRentals(input: VacationRentalSearchInput): Promise<StaySearchResult>;
   suggestFlightLocations(
     query: string,
-    options: { currency: CurrencyCode; language: TravelLanguage },
+    options: { currency: CurrencyCode; language: TravelLanguage; country: string },
   ): Promise<FlightLocationSuggestion[]>;
   closeAll(): Promise<void>;
 }
@@ -295,6 +327,7 @@ export interface FlightLocationLookupRequest {
   queries: string[];
   currency: CurrencyCode;
   language: TravelLanguage;
+  country: string;
   timeoutMs: number;
 }
 
@@ -307,6 +340,17 @@ export interface TravelRpcRequest {
   sourceUrl: string;
   responseUrlIncludes: string;
   timeoutMs: number;
+  inPage?: InPageRpcRecipe;
+}
+
+export interface InPageRpcRecipe {
+  sessionKey: "flights" | "stays";
+  bootstrapUrl: string;
+  endpointPath: string;
+  query: Record<string, string>;
+  headers: Record<string, string>;
+  body: string;
+  minimumResponseBytes: number;
 }
 
 export interface TravelRpcResponse {
@@ -317,7 +361,21 @@ export interface TravelRpcResponse {
   elapsedMs: number;
 }
 
+export interface WebPageSearchRequest {
+  sourceUrl: string;
+  limit: number;
+  timeoutMs: number;
+}
+
+export interface WebPageSearchResponse {
+  results: WebSearchItem[];
+  sourceUrl: string;
+  captureContextId: string;
+  elapsedMs: number;
+}
+
 export interface TravelRpcTransport {
+  searchWeb(request: WebPageSearchRequest): Promise<WebPageSearchResponse>;
   execute(request: TravelRpcRequest): Promise<TravelRpcResponse>;
   lookupFlightLocations(request: FlightLocationLookupRequest): Promise<FlightLocationLookupResult[]>;
   closeAll(): Promise<void>;
